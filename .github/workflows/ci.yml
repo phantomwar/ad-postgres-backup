@@ -1,0 +1,209 @@
+name: CI, E2E Matrix & Publish GHCR
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  unit-test:
+    name: Go Format, Vet & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Format & Vet
+        run: |
+          test -z "$(gofmt -l .)" || (echo "Unformatted Go files:" && gofmt -l . && exit 1)
+          go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -race -v ./...
+
+      - name: Build Verification
+        run: go build -v -o /dev/null ./cmd/ad-postgres-backup
+
+  matrix-e2e-and-publish:
+    name: E2E Docker & GHCR (PG ${{ matrix.pg_major }})
+    needs: [unit-test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: ["16", "17", "18", "19"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build single-arch image for live E2E tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ad-postgres-backup:test-${{ matrix.pg_major }}
+          build-args: |
+            PG_TAG=${{ matrix.pg_major }}-alpine
+            VERSION=${{ github.sha }}
+
+      - name: Run live backup + age + GFS + storage + restore-test E2E against PostgreSQL ${{ matrix.pg_major }}
+        run: |
+          set -euo pipefail
+          PG_MAJ="${{ matrix.pg_major }}"
+          NET="pgnet-${PG_MAJ}"
+          PG_NAME="pg-e2e-${PG_MAJ}"
+          IMG="ad-postgres-backup:test-${PG_MAJ}"
+          BDIR="/tmp/e2e-backups-${PG_MAJ}"
+          SDIR="/tmp/e2e-storage-${PG_MAJ}"
+
+          rm -rf "${BDIR}" "${SDIR}"
+          mkdir -p "${BDIR}" "${SDIR}"
+          chmod 777 "${BDIR}"
+          echo "sample uploaded pdf payload" > "${SDIR}/attachment.txt"
+
+          docker network create "${NET}"
+          docker run -d --name "${PG_NAME}" --network "${NET}" \
+            -e POSTGRES_USER=testuser \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=appdb \
+            "postgres:${PG_MAJ}-alpine"
+
+          for i in $(seq 1 30); do
+            if docker exec "${PG_NAME}" pg_isready -U testuser -d appdb >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          docker exec -i "${PG_NAME}" psql -U testuser -d appdb -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE TABLE items (id serial PRIMARY KEY, name text NOT NULL);
+            INSERT INTO items (name) VALUES ('alpha'), ('beta');
+          SQL
+
+          KEYS="$(docker run --rm "${IMG}" keygen)"
+          AGE_PUB="$(printf '%s\n' "${KEYS}" | awk -F= '/^BACKUP_AGE_RECIPIENTS=/{print $2}')"
+          AGE_SEC="$(printf '%s\n' "${KEYS}" | awk -F= '/^BACKUP_AGE_IDENTITY=/{print $2}')"
+          test -n "${AGE_PUB}"
+          test -n "${AGE_SEC}"
+
+          docker run --rm --network "${NET}" \
+            -v "${BDIR}:/backups" \
+            -v "${SDIR}:/storage:ro" \
+            -e POSTGRES_HOST="${PG_NAME}" \
+            -e POSTGRES_USER=testuser \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=appdb \
+            -e POSTGRES_EXTRA_OPTS="-Fc" \
+            -e BACKUP_SUFFIX=".dump" \
+            -e STORAGE_DIR=/storage \
+            -e BACKUP_AGE_RECIPIENTS="${AGE_PUB}" \
+            "${IMG}" backup
+
+          test -L "${BDIR}/last/appdb-latest.dump.age"
+          test -L "${BDIR}/daily/appdb-latest.dump.age"
+          test -L "${BDIR}/weekly/appdb-latest.dump.age"
+          test -L "${BDIR}/monthly/appdb-latest.dump.age"
+          test -f "${BDIR}/last/appdb-latest.dump.age.sha256"
+          test -L "${BDIR}/last/storage-latest.tar.gz.age"
+          ls -laR "${BDIR}"
+
+          RESTORE_OUT="$(docker run --rm \
+            -v "${BDIR}:/backups:ro" \
+            -e BACKUP_AGE_IDENTITY="${AGE_SEC}" \
+            -e RESTORE_TEST_QUERY="SELECT count(*) FROM items;" \
+            "${IMG}" restore-test)"
+          echo "${RESTORE_OUT}"
+          printf '%s\n' "${RESTORE_OUT}" | grep -q "query_result=2"
+
+          DAEMON_NAME="daemon-e2e-${PG_MAJ}"
+          docker run -d --name "${DAEMON_NAME}" --network "${NET}" \
+            -p 127.0.0.1:18080:8080 \
+            -v "${BDIR}:/backups" \
+            -e POSTGRES_HOST="${PG_NAME}" \
+            -e POSTGRES_USER=testuser \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=appdb \
+            -e BACKUP_ON_START=TRUE \
+            -e SCHEDULE="@daily" \
+            -e HEALTHCHECK_PORT=8080 \
+            "${IMG}"
+
+          HEALTH_OK=0
+          for i in $(seq 1 20); do
+            if docker exec "${DAEMON_NAME}" ad-postgres-backup healthcheck >/dev/null 2>&1; then
+              HEALTH_OK=1
+              break
+            fi
+            sleep 1
+          done
+          test "${HEALTH_OK}" -eq 1
+          curl -fsS http://127.0.0.1:18080/metrics | grep -q "ad_pg_backup_up 1"
+          docker rm -f "${DAEMON_NAME}"
+
+      - name: Cleanup E2E containers
+        if: always()
+        run: |
+          docker rm -f "daemon-e2e-${{ matrix.pg_major }}" "pg-e2e-${{ matrix.pg_major }}" >/dev/null 2>&1 || true
+          docker network rm "pgnet-${{ matrix.pg_major }}" >/dev/null 2>&1 || true
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags for GHCR
+        if: github.event_name != 'pull_request'
+        id: meta
+        run: |
+          MAJ="${{ matrix.pg_major }}"
+          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/ad-postgres-backup"
+          TAGS="${IMAGE}:${MAJ}-alpine"
+          if [ "${MAJ}" = "19" ]; then
+            TAGS="${TAGS},${IMAGE}:latest,${IMAGE}:alpine"
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/}"
+            TAGS="${TAGS},${IMAGE}:${VER}-${MAJ}-alpine"
+          fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push multi-arch image to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            PG_TAG=${{ matrix.pg_major }}-alpine
+            VERSION=${{ github.ref_name }}
