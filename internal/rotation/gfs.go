@@ -25,7 +25,7 @@ var Tiers = []string{"last", "daily", "weekly", "monthly"}
 // and updates <name>-latest<ext> pointers according to latestType ("symlink", "hardlink", or "none").
 func RotateGFS(backupDir, name, ext, tmpDataPath, tmpSumPath, latestType string, now time.Time) (string, error) {
 	for _, tier := range Tiers {
-		if err := os.MkdirAll(filepath.Join(backupDir, tier), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Join(backupDir, tier), 0o755); err != nil {
 			return "", fmt.Errorf("create tier dir %s: %w", tier, err)
 		}
 	}

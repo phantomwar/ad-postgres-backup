@@ -124,13 +124,13 @@ jobs:
             -e BACKUP_AGE_RECIPIENTS="${AGE_PUB}" \
             "${IMG}" backup
 
+          ls -laR "${BDIR}"
           test -L "${BDIR}/last/appdb-latest.dump.age"
           test -L "${BDIR}/daily/appdb-latest.dump.age"
           test -L "${BDIR}/weekly/appdb-latest.dump.age"
           test -L "${BDIR}/monthly/appdb-latest.dump.age"
           test -f "${BDIR}/last/appdb-latest.dump.age.sha256"
           test -L "${BDIR}/last/storage-latest.tar.gz.age"
-          ls -laR "${BDIR}"
 
           RESTORE_OUT="$(docker run --rm \
             -v "${BDIR}:/backups:ro" \

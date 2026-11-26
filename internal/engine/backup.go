@@ -58,7 +58,7 @@ func RunCycle(ctx context.Context, logger *slog.Logger, cfg *config.Config, runn
 	if err := cfg.ValidateForBackup(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(cfg.BackupDir, "last"), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Join(cfg.BackupDir, "last"), 0o755); err != nil {
 		return nil, fmt.Errorf("prepare backup dir: %w", err)
 	}
 	if err := cfg.ValidateDirWritable(); err != nil {
