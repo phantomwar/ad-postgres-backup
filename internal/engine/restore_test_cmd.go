@@ -56,6 +56,10 @@ func RunRestoreTest(ctx context.Context, logger *slog.Logger, cfg *config.Config
 	if err := os.MkdirAll(pgData, 0o700); err != nil {
 		return "", err
 	}
+	logFile := filepath.Join(tmpWork, "postgres.log")
+	if err := os.WriteFile(logFile, nil, 0o600); err != nil {
+		return "", err
+	}
 
 	useSuExec := false
 	if os.Geteuid() == 0 {
@@ -64,12 +68,16 @@ func RunRestoreTest(ctx context.Context, logger *slog.Logger, cfg *config.Config
 			gid, _ := strconv.Atoi(u.Gid)
 			_ = os.Chown(tmpWork, uid, gid)
 			_ = os.Chown(pgData, uid, gid)
+			_ = os.Chown(logFile, uid, gid)
 			_ = os.Chmod(tmpWork, 0o755)
 			useSuExec = true
 		}
 	}
 
-	runPG := func(bin string, args ...string) error {
+	// Only server daemons (initdb, pg_ctl) forbid running as root; client utilities
+	// (createdb, pg_restore, psql) connect over 127.0.0.1 (--auth=trust) as the caller UID
+	// so they retain read access to decrypted files and bind-mounted :ro backups.
+	runServerPG := func(bin string, args ...string) error {
 		if useSuExec {
 			wrapped := append([]string{"postgres", bin}, args...)
 			return runner.Run(ctx, "su-exec", wrapped, nil, nil, nil)
@@ -79,26 +87,29 @@ func RunRestoreTest(ctx context.Context, logger *slog.Logger, cfg *config.Config
 
 	portStr := strconv.Itoa(cfg.RestoreTestPort)
 	logger.Info("initializing ephemeral PostgreSQL cluster", "port", portStr)
-	if err := runPG("initdb", "-D", pgData, "-E", "UTF8", "--auth=trust", "-U", "postgres"); err != nil {
+	if err := runServerPG("initdb", "-D", pgData, "-E", "UTF8", "--auth=trust", "-U", "postgres"); err != nil {
 		return "", fmt.Errorf("initdb: %w", err)
 	}
 	pgOpts := fmt.Sprintf("-p %s -k %s -c listen_addresses=127.0.0.1", portStr, tmpWork)
-	if err := runPG("pg_ctl", "-D", pgData, "-o", pgOpts, "-w", "start"); err != nil {
+	if err := runServerPG("pg_ctl", "-D", pgData, "-l", logFile, "-o", pgOpts, "-w", "start"); err != nil {
+		if logBytes, rErr := os.ReadFile(logFile); rErr == nil && len(logBytes) > 0 {
+			return "", fmt.Errorf("pg_ctl start: %w\n--- postgres.log ---\n%s", err, strings.TrimSpace(string(logBytes)))
+		}
 		return "", fmt.Errorf("pg_ctl start: %w", err)
 	}
 	defer func() {
-		_ = runPG("pg_ctl", "-D", pgData, "-m", "immediate", "stop")
+		_ = runServerPG("pg_ctl", "-D", pgData, "-m", "immediate", "stop")
 	}()
 
 	const targetDB = "restore_verify"
-	if err := runPG("createdb", "-h", "127.0.0.1", "-p", portStr, "-U", "postgres", targetDB); err != nil {
+	if err := runner.Run(ctx, "createdb", []string{"-h", "127.0.0.1", "-p", portStr, "-U", "postgres", targetDB}, nil, nil, nil); err != nil {
 		return "", fmt.Errorf("createdb: %w", err)
 	}
 
 	lower := strings.ToLower(plainPath)
 	switch {
 	case strings.HasSuffix(lower, ".dump") || isDir(plainPath):
-		if err := runPG("pg_restore", "-h", "127.0.0.1", "-p", portStr, "-U", "postgres", "-d", targetDB, "--no-owner", "--no-privileges", plainPath); err != nil {
+		if err := runner.Run(ctx, "pg_restore", []string{"-h", "127.0.0.1", "-p", portStr, "-U", "postgres", "-d", targetDB, "--no-owner", "--no-privileges", plainPath}, nil, nil, nil); err != nil {
 			return "", fmt.Errorf("pg_restore: %w", err)
 		}
 	case strings.HasSuffix(lower, ".sql.gz") || strings.HasSuffix(lower, ".gz"):

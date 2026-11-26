@@ -67,6 +67,8 @@ jobs:
           context: .
           load: true
           tags: ad-postgres-backup:test-${{ matrix.pg_major }}
+          cache-from: type=gha,scope=pg-${{ matrix.pg_major }}
+          cache-to: type=gha,mode=max,scope=pg-${{ matrix.pg_major }}
           build-args: |
             PG_TAG=${{ matrix.pg_major }}-alpine
             VERSION=${{ github.sha }}
@@ -93,8 +95,8 @@ jobs:
             -e POSTGRES_DB=appdb \
             "postgres:${PG_MAJ}-alpine"
 
-          for i in $(seq 1 30); do
-            if docker exec "${PG_NAME}" pg_isready -U testuser -d appdb >/dev/null 2>&1; then
+          for i in $(seq 1 40); do
+            if docker exec -e PGPASSWORD=testpass "${PG_NAME}" psql -h 127.0.0.1 -U testuser -d appdb -c "SELECT 1" >/dev/null 2>&1; then
               break
             fi
             sleep 1
@@ -204,6 +206,7 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=pg-${{ matrix.pg_major }}
           build-args: |
             PG_TAG=${{ matrix.pg_major }}-alpine
             VERSION=${{ github.ref_name }}
